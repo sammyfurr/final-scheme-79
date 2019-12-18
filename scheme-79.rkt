@@ -15,6 +15,9 @@
   (vector-set! control-pla micro-address micro-word)
   micro-address)
 
+(define-syntax-rule (defntype micro-alias micro-word)
+  (define micro-alias (deftype (get-next-address) micro-word)))
+
 (define-syntax-rule (defchip micro-alias micro-address)
   (define micro-alias (deftype micro-address #o000)))
 
@@ -24,25 +27,29 @@
 (define-syntax-rule (defpc micro-alias micro-word)
   (define micro-alias (deftype (get-next-address) micro-word)))
 
-;; (define in-use (arithmetic-shift 1 31))
-
-;; (define (in-use? x) (bitwise-bit-set? x 31))
-
 (define (type-shift x) (arithmetic-shift x 24))
+(define (type-unshift x) (arithmetic-shift (use-unset x) -24))
 (define type-clear #o20077777777)
 (define (type-equal? x t) (= (type x) t))
 
 (define (datum x) (bitwise-and x #o00077777777))
 (define (datum-set x y) (bitwise-ior (type+use x) (datum y))) ;; return x with y's datum
+
+(define (displacement x) (arithmetic-shift (datum x) 11))
+(define (frame x) (bitwise-and x #o3777))
+
 (define (type x) (bitwise-and x #o17700000000))
-(define (p-type x) (if (= (bitwise-and x #o10000000000) #o10000000000) true false))
+(define (p-type x) (= (bitwise-and x #o10000000000) #o10000000000))
+
 (define (type+use x) (bitwise-and x #o37700000000))
 
-(define (use? x) (if (= (bitwise-and x #o20000000000) #o20000000000) true false))
-(define (use-set x) (bitwise-and x #o20000000000))
+(define (use? x) (= (bitwise-and x #o20000000000) #o20000000000))
+(define (use-set x) (bitwise-ior x #o20000000000))
+(define (use-unset x) (bitwise-and x #o17777777777))
 
-(define (trace? x) (if (= (bitwise-and x #o20000000000) #o20000000000) true false))
+(define (trace? x) (= (bitwise-and x #o20000000000) #o20000000000))
 (define (trace-set x) (bitwise-ior x #o20000000000))
+(define (trace-unset x) (bitwise-and x #o17777777777))
 ;; Types (op-codes)
 
 (defchip symbol #o001)
@@ -126,9 +133,9 @@
 ;; Pads
 (define address/data #o0)
 (define gc-needed #o0)
+(define interrupt-request #o0)
 
-
-(define-syntax-rule (assign reg source) (set! reg (datum-set reg source)))
+(define-syntax-rule (assign reg source) (set! reg source))
 (define (fetch reg) reg)
 
 ;;; Memory
@@ -137,36 +144,97 @@
 (define (mem-set! addr acar acdr) (vector-set! mem addr (cons acar acdr)))
 (define (mem-car addr) (car (vector-ref mem addr)))
 (define (mem-cdr addr) (cdr (vector-ref mem addr)))
-(define (mem-set-car! addr acar) (vector-set! mem addr (cons acar (cdr (vector-ref mem addr)))))
-(define (mem-set-cdr! addr acdr) (vector-set! mem addr (cons (car (vector-ref mem addr)) acdr)))
+(define (mem-set-car! addr acar)
+  (vector-set! mem addr (cons acar (cdr (vector-ref mem addr)))))
+(define (mem-set-cdr! addr acdr)
+  (vector-set! mem addr (cons (car (vector-ref mem addr)) acdr)))
 
-;; Hardware ops
+;;; Hardware ops
 
-(define (&=type? addr type) (type-equal? (mem-car addr) (type-shift type)))
+(define (&=type? reg type) (type-equal? reg (type-shift type)))
 
-(define (&car addr) (fetch (mem-car addr)))
-(define (&cdr addr) (fetch (mem-cdr addr)))
 
-(define (&rplaca addr1 addr2) (mem-set-car! addr1 (mem-car addr2)))
-(define (&rplacd addr1 addr2) (mem-set-cdr! addr1 (mem-cdr addr2)))
-(define (&rplaca-and-mark! addr1 addr2) (&rplaca addr1 addr2) (&mark-in-use! addr1))
+(define (&cons reg1 reg2)
+  (cond ((= *newcell* *memtop*)
+         (display "Sorry, garbage collection isn't implemented yet.\n")
+         (go-to done))
+        (true
+         (&rplaca *newcell* reg1)
+         (&rplacd *newcell* reg2)
+         (set! *newcell* (+ *newcell* 1))
+         (- *newcell* 1))))
+
+(define (&car reg) (fetch (mem-car (datum reg))))
+(define (&cdr reg) (fetch (mem-cdr (datum reg))))
+(define &global-value &car)
+
+(define (&rplaca reg1 reg2) (mem-set-car! (datum reg1) reg2))
+(define (&rplacd reg1 reg2) (mem-set-cdr! (datum reg1) reg2))
+(define &set-global-value &rplaca)
 
 (define (&pointer? addr1) (p-type addr1))
 
-(define (&in-use? addr1) (use? (mem-car addr1)))
-(define (&mark-in-use! addr1) (vector-set! addr1 (use-set (mem-car addr1))))
+(define (&get-interrupt-routine-pointer)
+  (when (= interrupt-request #o1) (datum address/data)))
+(define-syntax-rule (&set-type reg type)
+  (set! reg (bitwise-ior (type-shift type) reg)))
+
+(define (&frame=0?) (= (frame *exp*) #o0))
+(define (&decrement-frame) (set! *exp* (- *exp* #o1)))
+
+(define (&displacement=0?) (= (displacement *exp*) #o0))
+(define (&decrement-displacement)
+  (set! *exp* (bitwise-ior
+               (type+use *exp*)
+               (arithmetic-shift (- (displacement *exp*) #o1) 11)
+               (frame *exp*))))
+
+(define (&eq-val reg) (= *val* reg))
+
+;; Used by garbage collector
+
+(define (&rplaca-and-mark! addr1 addr2) (&rplaca addr1 addr2) (&mark-in-use! addr1))
+
+(define (&in-use? reg) (use? reg))
+(define (&mark-in-use! addr1) (vector-set! mem addr1 (cons (use-set (mem-car addr1)) (mem-cdr addr1))))
+(define (&unmark! addr1) (vector-set! mem addr1 (cons (use-unset (mem-car addr1)) (mem-cdr addr1))))
 
 (define (&car-being-traced? addr1) (trace? (mem-cdr addr1)))
-(define (&mark-car-being-traced! addr1) (vector-set! addr1 (trace-set (mem-cdr addr1))))
+(define (&mark-car-being-traced! addr1) (vector-set! mem addr1 (cons (mem-car addr1) (trace-set (mem-cdr addr1)))))
+(define (&mark-car-trace-over! addr1) (vector-set! mem addr1 (cons (mem-car addr1) (trace-unset (mem-cdr addr1)))))
 
 (define (&clear-gc-needed) (set! gc-needed #o0))
 
+(define (&scan-down=0?) (= *scan-down* #o0))
+
 (define-syntax-rule (&increment-scan-up) (set! *scan-up* (add1 *scan-up*)))
 (define-syntax-rule (&decrement-scan-down) (set! *scan-down* (sub1 *scan-down*)))
-(define (&scan-up=scan-down?) (if (= *scan-up*  *scan-down*) true false))
+(define (&scan-up=scan-down?) (= *scan-up* *scan-down*))
 
-(define (&get-interrupt-routine-pointer) (fetch address/data))
-(define-syntax-rule (&set-type reg type) (set! reg (bitwise-ior (type-shift type) reg)))
+(define (micro-call maddr1 maddr2)
+  ;; This is storing the micro-return address maddr1 in type field of *retpc-count-mark*
+  (&set-type *retpc-count-mark* maddr2)
+  (go-to maddr1))
+
+(define (micro-return)
+  ;; This returns to the micro-return address maddr1 in type field of *retpc-count-mark*
+  (go-to (type-unshift (fetch *retpc-count-mark*))))
+
+(define (save quantity)
+  (assign *stack* (&cons quantity (fetch *stack*))))
+
+(define (restore register)
+  (begin (assign register (&car (fetch *stack*)))
+         (assign *stack* (&cdr (fetch *stack*)))))
+
+(define (dispatch reg)
+  (go-to (type-unshift (fetch reg))))
+
+(define (dispatch-on-stack)
+  (dispatch *stack*))
+
+(define (dispatch-on-exp-allowing-interrupts)
+  (dispatch *exp*))
 
 ;;; Micro-word simulation definitions
 
@@ -175,18 +243,19 @@
 (deftype boot-load
   (lambda () 
     (assign *scan-up* (fetch *nil*))
-    (&increment-scan-up)
+    (&increment-scan-up) ;; also makes *newcell* 1
     (assign *memtop* (&car (fetch *scan-up*)))
     (assign *scan-up* (fetch *memtop*))
     (assign *stack* (&get-interrupt-routine-pointer))
     (&set-type *stack* boot-load-return)
-    (go-to done))) ;; should be mark
+    (go-to boot-load-return))) ;; should be mark
 
 (defreturn boot-load-return
   (lambda ()
     (assign *exp* (&car (fetch *stack*)))
     (assign *stack* (fetch *nil*))
-    (&set-type *stack* done)))
+    (&set-type *stack* done)
+    (dispatch-on-exp-allowing-interrupts)))
 
 (deftype done
   (lambda ()
@@ -232,9 +301,21 @@
 
 (defpc up-trace
   (lambda ()
+    (print-reg '*stack-top* *stack-top*)
     (cond ((&=type? (fetch *stack-top*) gc-special-type)
            (go-to sweep))
-          (true))))
+          (true (assign *leader* (fetch *stack-top*))
+                (cond ((&car-being-traced? (fetch *leader*))
+                       (&mark-car-being-traced! (fetch *leader*))
+                       (assign *stack-top* (&car (fetch *leader*)))
+                       (&rplaca-and-mark! (fetch *leader*)
+                                          (fetch *node-pointer*))
+                       (assign *node-pointer* (fetch *leader*))
+                       (go-to trace-cdr))
+                      (true (assign *stack-top* (&cdr (fetch *leader*)))
+                            (&rplacd (fetch *leader*) (fetch *node-pointer*))
+                            (assign *node-pointer* (fetch *leader*))
+                            (go-to up-trace)))))))
 
 (defpc sweep
   (lambda ()
@@ -248,7 +329,25 @@
 (defpc scan-down-for-thing
   (lambda ()
     (&decrement-scan-down)
-    (cond ((&scan-up=scan-down?) (go-to relocate-pointers)))))
+    (cond ((&scan-up=scan-down?) (go-to relocate-pointers))
+          ((&in-use? (fetch *scan-down*)) (go-to scan-up-for-hole))
+          (true (go-to scan-down-for-thing)))))
+
+(defpc scan-up-for-hole
+  (lambda () 
+    (cond ((&in-use? (fetch *scan-up*))
+           (&increment-scan-up)
+           (cond ((&scan-up=scan-down?) (go-to relocate-pointers))
+                 (true (go-to scan-up-for-hole))))
+          (true (go-to swap-thing-and-hole)))))
+
+(defpc swap-thing-and-hole
+  (lambda ()
+    (print-reg '*scan-down* *scan-down*) 
+    (&rplaca-and-mark! (fetch *scan-up*) (&car (fetch *scan-down*)))
+    (&rplacd (fetch *scan-up*) (&cdr (fetch *scan-down*)))
+    (&rplaca (fetch *scan-down*) (fetch *scan-up*))
+    (go-to scan-down-for-thing)))
 
 (defpc relocate-pointers
   (lambda ()
@@ -256,15 +355,250 @@
     (cond ((&pointer? (fetch *rel-tem-1*))
            (assign *rel-tem-2* (&car (fetch *rel-tem-1*)))
            (cond ((&=type? (fetch *rel-tem-2*) gc-special-type)
-                  (&set-type *rel-tem-2* (fetch *rel-tem-1*))))))))
+                  (&set-type *rel-tem-2* (fetch *rel-tem-1*))))))
+    (assign *rel-tem-1* (&cdr (fetch *scan-down*)))
+    (cond ((&pointer? (fetch *rel-tem-1*))
+           (assign *rel-tem-2* (&car (fetch *rel-tem-1*)))
+           (cond ((&=type? (fetch *rel-tem-2*) gc-special-type)
+                  (&set-type *rel-tem-2* (fetch *rel-tem-1*))
+                  (&rplacd (fetch *scan-down*) (fetch *rel-tem-2*))))))
+    (&unmark! (fetch *scan-down*))
+    (cond ((&scan-down=0?)
+           (&set-type *scan-up* self-evaluating-pointer)
+           (assign *stack* (&car (fetch *nil*)))
+           (&rplaca (fetch *nil*) (fetch *nil*))
+           (assign *val* (fetch *nil*))
+           (dispatch-on-stack))
+          (true (&decrement-scan-down)
+                (go-to relocate-pointers)))))
+
+(deftype local
+  (lambda ()
+    (micro-call lookup-exp local-return)))
+
+(defpc local-return
+  (lambda ()
+    (assign *val* (&car (fetch *display*)))
+    (dispatch-on-stack)))
+
+(deftype tail-local
+  (lambda ()
+    (micro-call lookup-exp tail-local-return)))
+
+(defpc tail-local-return
+  (lambda ()
+    (assign *val* (fetch *display*))
+    (dispatch-on-stack)))
+
+(deftype global
+  (lambda ()
+    (assign *val*
+            (&global-value (fetch *exp*)))
+    (dispatch-on-stack)))
+
+(deftype set-local
+  (lambda ()
+    (micro-call lookup-exp set-local-return)))
+
+(defpc set-local-return
+  (lambda ()
+    (&rplaca (fetch *display*) (fetch *val*))
+    (dispatch-on-stack)))
+
+(defntype set-tail-local
+  (lambda ()
+    (micro-call lookup-exp set-tail-local-return)))
+
+(defpc (set-tail-local-return)
+  (lambda ()
+    (&rplacd (fetch *display*) (fetch *val*))
+    (dispatch-on-stack)))
+
+(deftype set-only-tail-local
+  (lambda ()
+    (if (&frame=0?)
+        (begin (&rplaca (fetch *display*) (fetch *val*))
+               (dispatch-on-stack))
+        (begin (assign *display* (&cdr (fetch *display*)))
+               (&decrement-frame)
+               (go-to set-only-tail-local)))))
+
+(deftype set-global
+  (lambda ()
+    (&set-global-value (fetch *exp*) (fetch *val*))
+    (dispatch-on-stack)))
+
+(defpc lookup-exp
+  (lambda ()
+    (if (&frame=0?)
+        (begin (assign *display* (&car (fetch *display*)))
+               (go-to count-displacement))
+        (begin (&decrement-frame)
+               (assign *display* (&cdr (fetch *display*)))
+               (go-to lookup-exp)))))
+
+(defpc count-displacement
+  (lambda ()
+    (if (&displacement=0?)
+        (micro-return)
+        (begin (&decrement-displacement)
+               (assign *display* (&cdr (fetch *display*)))
+               (go-to count-displacement)))))
+
+(deftype self-evaluating-immediate
+  (lambda ()
+    (assign *val* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(deftype self-evaluating-immediate-1
+  (lambda ()
+    (assign *val* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(deftype self-evaluating-immediate-2
+  (lambda ()
+    (assign *val* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(deftype self-evaluating-immediate-3
+  (lambda ()
+    (assign *val* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(deftype self-evaluating-immediate-4
+  (lambda ()
+    (assign *val* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(deftype symbol
+  (lambda ()
+    (assign *val* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(defntype self-evaluating-pointer
+  (lambda ()
+    (assign *val* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(deftype self-evaluating-pointer-1
+  (lambda ()
+    (assign *val* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(deftype self-evaluating-pointer-2
+  (lambda ()
+    (assign *val* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(deftype self-evaluating-pointer-3
+  (lambda ()
+    (assign *val* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(deftype self-evaluating-pointer-4
+  (lambda ()
+    (assign *val* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(deftype procedure
+  (lambda ()
+    (assign *val* (&cons (fetch *exp*) (fetch *display*)))
+    (&set-type *val* closure)
+    (dispatch-on-stack)))
+
+(deftype conditional
+  (lambda ()
+    (if (&eq-val (fetch *nil*))
+        (assign *exp* (&cdr (fetch *exp*)))
+        (assign *exp* (&car (fetch *exp*))))
+    (dispatch-on-exp-allowing-interrupts)))
+
+;; Micro return address stored in *retpc-count-mark*, which will be stuck on the stack.
+;; Then we evaluate the car.
+(define (save-cdr-and-eval-car return-tag)
+  (begin (&set-type *retpc-count-mark* return-tag)
+         (go-to standard-eval)))
+
+(defpc (standard-eval)
+  (lambda ()
+    (save (fetch *display*))
+    (&set-type *stack* (fetch *retpc-count-mark*))
+    (save (&cdr (fetch *exp*)))
+    (&set-type *stack* standard-return)
+    (assign *exp* (&car (fetch *exp*)))
+    (dispatch-on-exp-allowing-interrupts)))
+
+(defreturn standard-return
+  (lambda ()
+    (restore *exp*)
+    (assign *retpc-count-mark* (fetch *stack*))
+    (restore *display*)
+    (dispatch (fetch *retpc-count-mark*))))
+
+(deftype sequence
+  (lambda ()
+    (assign *val* (fetch *nil*))
+    (save-cdr-and-eval-car sequence-return)))
+
+(defreturn sequence-return
+  (lambda ()
+    (dispatch-on-exp-allowing-interrupts)))
+
+(deftype get-control-point
+  (lambda ()
+    (assign *val* (&cons (fetch *stack*) (fetch *nil*)))
+    (&set-type *val* control-point)
+    (save-cdr-and-eval-car sequence-return)))
+
+;; Eval arg1...argn-1. argn-1 is the body of the procedure being executed
+(deftype first-argument
+  (lambda ()
+    (save-cdr-and-eval-car first-argument-return)))
+
+(defreturn first-argument-return
+  (lambda ()
+    ;; val has been set by standard-eval earlier.  We start making a list of arguments here,
+    ;; *args* -> (*val* . *nil*)
+    (assign *args* (&cons (fetch *val*) (fetch *nil*)))
+    (save (fetch *args*))
+    (dispatch-on-exp-allowing-interrupts)))
+
+(deftype next-argument
+  (lambda ()
+    (save (fetch *args*))
+    (save-cdr-and-eval-car next-argument-return)))
+
+(defreturn next-argument-return
+  (lambda ()
+    (restore *args*)
+    ;; *args* -> (val . (val . nil)), or more
+    (&rplacd (fetch *args*) (&cons (fetch *val*) (fetch *nil*)))
+    (assign *args* (&cdr (fetch *args*)))
+    (dispatch-on-exp-allowing-interrupts)))
+
+(deftype last-argument
+  (lambda ()
+    (save (fetch *args*))
+    (save-cdr-and-eval-car last-argument-return)))
+
+(defreturn last-argument-return
+  (lambda ()
+    (restore *args*)
+    (&rplacd (fetch *args*)
+             (&cons (fetch *val*) (fetch *nil*)))
+    ;; popj is not self documenting in 2019...
+    ;; its the return from subroutine instruction on a PDP10
+    (eval-exp-popj-to internal-apply)))
 
 ;; Mem-init
-(mem-set! #o0 #o0 #o0)
-(mem-set! #o1 #o1000 #o0)
+(mem-set! #o0 #o0 #o0)       ;; NIL
+(mem-set! #o1 #o1000 #o0)    ;; initial *MEMTOP*
+(set! address/data #o1001)     ;; interrrupt vector, has location of proc to exec
+(set! interrupt-request #o1) ;; we will read an interrupt
+(mem-set! #o1001 (bitwise-ior (use-set (type-shift global)) #o33) #o0)
 
 (define (cycle state)
   ((vector-ref control-pla state)))
-
 
 ;; Debug functions
 (define (print-mem-addr addr)
@@ -280,7 +614,7 @@
   (newline))
 
 (define (print-reg alias v)
-  (printf "~a: ~o | in-use: ~o | type: ~o | datum: ~o\n" alias v (use-set v) (type v) (datum v)))
+  (printf "~a: ~o | in-use: ~o | type: ~o | datum: ~o\n" alias v (if (use? v) 1 0) (type v) (datum v)))
 
 (define (print-registers)
   (display "Registers:\n")
@@ -308,9 +642,20 @@
     (cycle state)
     (run)))
 
-(print-registers)
-(print-mem 10)
+(define (step)
+  (cond ((= state done)
+         (print-registers)
+         (print-mem 20))
+        (true
+         (print-registers)
+         (print-mem 10)
+         (cycle state)
+         (display "continue ")
+         (read)
+         (step))))
+
+(type-unshift #o20200000033)
 (go-to boot-load)
-(run)
+(step)
 (print-registers)
-(print-mem 10)
+(print-mem 20)
