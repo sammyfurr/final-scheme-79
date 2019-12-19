@@ -3,29 +3,34 @@
 ;; Microcode construction functions
 
 (define control-pla (make-vector #o1777 null))
+(define control-pla-alias (make-vector #o1777 null))
 
 (define (get-next-address)
   (define (get-addr s)
     (if (null? (vector-ref control-pla s))
         s
         (get-addr (+ s 1))))
-  (get-addr 0))
+  (get-addr 1))
 
 (define (deftype micro-address micro-word)
   (vector-set! control-pla micro-address micro-word)
+  
   micro-address)
 
 (define-syntax-rule (defntype micro-alias micro-word)
   (define micro-alias (deftype (get-next-address) micro-word)))
 
 (define-syntax-rule (defchip micro-alias micro-address)
-  (define micro-alias (deftype micro-address #o000)))
+  (begin (vector-set! control-pla-alias micro-address (quote micro-alias))
+         (define micro-alias (deftype micro-address #o000))))
 
 (define-syntax-rule (defreturn micro-alias micro-word)
-  (define micro-alias (deftype (get-next-address) micro-word)))
+  (begin (vector-set! control-pla-alias (get-next-address) (quote micro-alias))
+         (define micro-alias (deftype (get-next-address) micro-word))))
 
 (define-syntax-rule (defpc micro-alias micro-word)
-  (define micro-alias (deftype (get-next-address) micro-word)))
+  (begin (vector-set! control-pla-alias (get-next-address) (quote micro-alias))
+         (define micro-alias (deftype (get-next-address) micro-word))))
 
 (define (type-shift x) (arithmetic-shift x 24))
 (define (type-unshift x) (arithmetic-shift (use-unset x) -24))
@@ -190,6 +195,20 @@
                (frame *exp*))))
 
 (define (&eq-val reg) (= *val* reg))
+(define (&val=0?) (= (datum *val*) 0))
+
+(define (&decrement-scan-down-to-val) (set! *val* (sub1 *scan-down*)))
+(define (&increment-scan-up-to-val) (set! *val* (add1 *scan-up*)))
+(define (&val-displacement-to-exp-displacement)
+  (set! *exp* (bitwise-ior
+               (type+use *exp*)
+               (arithmetic-shift (displacement *val*) 11)
+               (frame *exp*))))
+(define (&val-frame-to-exp-frame)
+  (set! *exp* (bitwise-ior
+               (type+use *exp*)
+               (arithmetic-shift (displacement *exp*) 11)
+               (frame *val*))))
 
 ;; Used by garbage collector
 
@@ -235,6 +254,9 @@
 
 (define (dispatch-on-exp-allowing-interrupts)
   (dispatch *exp*))
+
+(define (eval-exp-popj-to type)
+  (go-to type)) ;; fucking "Amazing! where did retpc go" IS NOT DOCUMENTATION!!!!!
 
 ;;; Micro-word simulation definitions
 
@@ -519,10 +541,10 @@
   (begin (&set-type *retpc-count-mark* return-tag)
          (go-to standard-eval)))
 
-(defpc (standard-eval)
+(defpc standard-eval
   (lambda ()
     (save (fetch *display*))
-    (&set-type *stack* (fetch *retpc-count-mark*))
+    (&set-type *stack* (type-unshift (type (fetch *retpc-count-mark*)))) ;; we need this different cause of way we did types
     (save (&cdr (fetch *exp*)))
     (&set-type *stack* standard-return)
     (assign *exp* (&car (fetch *exp*)))
@@ -590,12 +612,206 @@
     ;; its the return from subroutine instruction on a PDP10
     (eval-exp-popj-to internal-apply)))
 
+(deftype apply-1-arg
+  (lambda ()
+    (save-cdr-and-eval-car apply-1-arg-return)))
+
+(defreturn apply-1-arg-return
+  (lambda ()
+    (assign *args* (&cons (fetch *val*) (fetch *nil*)))
+    (save (fetch *args*))
+    (eval-exp-popj-to internal-apply)))
+
+(deftype apply-no-args
+  (lambda ()
+    (assign *exp* (&car (fetch *exp*)))
+    (save (fetch *nil*))
+    (eval-exp-popj-to internal-apply)))
+
+(deftype spread-argument
+  (lambda ()
+    (save-cdr-and-eval-car spread-argument-return)))
+
+(defreturn spread-argument-return
+  (lambda ()
+    (save (fetch *val*))
+    (eval-exp-popj-to internal-apply)))
+
+(defreturn internal-apply
+  (lambda ()
+    (restore *args*)
+    (assign *exp* (fetch *val*))
+    (dispatch-on-exp-allowing-interrupts)))
+
+(deftype closure
+  (lambda ()
+    (assign *display*
+            (&cons (fetch *args*) (&cdr (fetch *exp*))))
+    (assign *exp* (&car (&car (fetch *exp*)))) ;; 2 cars because documentation is in first
+    (dispatch-on-exp-allowing-interrupts)))
+
+(deftype control-point
+  (lambda ()
+    (assign *val* (&car (fetch *args*))) ;; This arg will be used by constructor of control point
+    (assign *stack* (&car (fetch *exp*)))
+    (dispatch-on-stack)))
+
+(deftype interrupt-point
+  (lambda ()
+    (assign *stack* (fetch *exp*))
+    (restore *val*)
+    (restore *display*)
+    (go-to restore-exp-args-dispatch)))
+
+(deftype primitive-apply-1
+  (lambda ()
+    (save (&cdr (fetch *exp*)))
+    (assign *exp* (&car (fetch *exp*)))
+    (eval-exp-popj-to primitive-apply-1-return)))
+
+(defreturn primitive-apply-1-return
+  (lambda ()
+    (restore *exp*)
+    (dispatch-on-exp-allowing-interrupts)))
+
+(deftype primitive-car
+  (lambda ()
+    (assign *val* (&car (fetch *val*)))
+    (dispatch-on-stack)))
+
+(deftype primitive-cdr
+  (lambda ()
+    (assign *val* (&cdr (fetch *val*)))
+    (dispatch-on-stack)))
+
+(deftype primitive-type?
+  (lambda ()
+    (assign *exp* (fetch *val*))
+    (assign *val* (fetch *nil*))
+    (&set-type *val* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(deftype primitive-not-atom
+  (lambda ()
+    (if (&pointer? (fetch *val*))
+        (begin (assign *val* (fetch *nil*))
+               (&set-type *val* self-evaluating-immediate))
+        (assign *val* (fetch *nil*)))
+    (dispatch-on-stack)))
+
+(deftype primitive-zerop
+  (lambda ()
+    (if (&val=0?)
+        (begin (assign *val* (fetch *nil*))
+               (&set-type *val* self-evaluating-immediate))
+        (assign *val* (fetch *nil*)))
+    (dispatch-on-stack)))
+
+(deftype primitive-sub1
+  (lambda ()
+    (assign *scan-down* (fetch *val*))
+    (&decrement-scan-down-to-val)
+    (dispatch-on-stack)))
+
+(deftype primitive-add1
+  (lambda ()
+    (assign *exp* (fetch *scan-up*))
+    (assign *scan-up* (fetch *val*))
+    (&increment-scan-up-to-val)
+    (assign *scan-up* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(deftype primitive-displacement-add1
+  (lambda ()
+    (assign *exp* (fetch *nil*))
+    (&decrement-frame)
+    (&val-displacement-to-exp-displacement)
+    (assign *args* (fetch *scan-up*))
+    (assign *scan-up* (fetch *exp*))
+    (&increment-scan-up)
+    (assign *exp* (fetch *scan-up*))
+    (&val-frame-to-exp-frame)
+    (assign *val* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(deftype primitive-apply-2
+  (lambda ()
+    (save (fetch *args*))
+    (save (&cdr (fetch *exp*)))
+    (assign *exp* (&car (fetch *exp*)))
+    (eval-exp-popj-to restore-exp-args-dispatch)))
+
+(defreturn restore-exp-args-dispatch
+  (lambda ()
+    (restore *exp*)
+    (restore *args*)
+    (dispatch-on-exp-allowing-interrupts)))
+
+(deftype primitive-cons
+  (lambda ()
+    (&rplacd (fetch *args*) (fetch *val*))
+    (restore *val*)
+    (dispatch-on-stack)))
+
+(deftype primitive-eq
+  (lambda ()
+    (restore *args*)
+    (assign *args* (&car (fetch *args*)))
+    (if (&eq-val (fetch *args*))
+        (begin (assign *val* (fetch *nil*))
+               (&set-type *val* self-evaluating-immediate))
+        (assign *val* (fetch *nil*)))
+    (dispatch-on-stack)))
+
+(deftype primitive-rplaca
+  (lambda ()
+    (restore *args*)
+    (assign *val* (&rplaca (&car (fetch *args*)) (fetch *val*)))
+    (dispatch-on-stack)))
+
+(deftype primitive-rplacd
+  (lambda ()
+    (restore *args*)
+    (assign *val* (&rplacd (&car (fetch *args*)) (fetch *val*)))
+    (dispatch-on-stack)))
+
+(deftype primitive-type!
+  (lambda ()
+    (restore *args*)
+    (assign *exp* *val*)
+    (assign *val* (&car (fetch *args*)))
+    (&set-type *val* (fetch *exp*))
+    (dispatch-on-stack)))
+
+(deftype process-interrupt
+  (lambda ()
+    (save (fetch *args*))
+    (save (fetch *exp*))
+    (save (fetch *display*))
+    (save (fetch *val*))
+    (&set-type *stack* interrupt-point)
+    (assign *args* (fetch *stack*))
+    (assign *exp* (&car (&get-interrupt-routine-pointer)))
+    (dispatch-on-exp-allowing-interrupts)))
+
 ;; Mem-init
 (mem-set! #o0 #o0 #o0)       ;; NIL
 (mem-set! #o1 #o1000 #o0)    ;; initial *MEMTOP*
 (set! address/data #o1001)     ;; interrrupt vector, has location of proc to exec
 (set! interrupt-request #o1) ;; we will read an interrupt
-(mem-set! #o1001 (bitwise-ior (use-set (type-shift global)) #o33) #o0)
+
+(define (make-car t d)
+  (bitwise-ior (type-shift t) d))
+
+(define make-cdr make-car)
+
+;; (mem-set! #o1001 (make-car self-evaluating-immediate-1 #o11) #o0)
+
+(mem-set! #o1001 (make-car spread-argument #o1002) #o1100)
+(mem-set! #o1002 (make-car first-argument #o1003) #o1004)
+(mem-set! #o1003 (make-car self-evaluating-immediate-1 #o11) #o0)
+(mem-set! #o1004 (make-car last-argument #o1005) #o1100)
+(mem-set! #o1004 (make-car self-evaluating-immediate-1 #o12) #o0)
 
 (define (cycle state)
   ((vector-ref control-pla state)))
@@ -613,8 +829,17 @@
   (mp 0)
   (newline))
 
+(define (get-control-alias type)
+  (vector-ref control-pla-alias type))
+
 (define (print-reg alias v)
-  (printf "~a: ~o | in-use: ~o | type: ~o | datum: ~o\n" alias v (if (use? v) 1 0) (type v) (datum v)))
+  (printf "~a: ~o | in-use: ~o | type: ~o ~a | datum: ~o\n"
+          alias
+          v
+          (if (use? v) 1 0)
+          (type-unshift (type v))
+          (get-control-alias (type-unshift (type v)))
+          (datum v)))
 
 (define (print-registers)
   (display "Registers:\n")
@@ -637,6 +862,9 @@
   (print-reg '*intermediate-argument* *intermediate-argument*)
   (newline))
 
+(define (print-state)
+  (printf "State: ~o ~a\n\n" state (get-control-alias state)))
+
 (define (run)
   (unless (= state done)
     (cycle state)
@@ -644,18 +872,19 @@
 
 (define (step)
   (cond ((= state done)
+         (print-state)
          (print-registers)
-         (print-mem 20))
+         (print-mem (+ *newcell* #o2)))
         (true
+         (print-state)
          (print-registers)
-         (print-mem 10)
+         (print-mem (+ *newcell* #o2))
          (cycle state)
          (display "continue ")
          (read)
          (step))))
 
-(type-unshift #o20200000033)
+;;(display control-pla-alias)
+
 (go-to boot-load)
 (step)
-(print-registers)
-(print-mem 20)
