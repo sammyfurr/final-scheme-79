@@ -961,7 +961,7 @@
 ;; (mem-set! #o1002 (make-car self-evaluating-pointer-1 #o2000) (make-cdr primitive-cdr #o0))
 ;; (mem-set! #o2000 (make-car self-evaluating-immediate-1 #o11) (make-cdr self-evaluating-immediate-1 #o12))
 
-((lambda () 3))
+;;((lambda () 3))
 (mem-set! #o1001 (make-car apply-no-args #o1002) #o0)
 (mem-set! #o1002 (make-car procedure #o2000) #o0)
 (mem-set! #o2000 (make-car self-evaluating-immediate #o3) #o0)
