@@ -1,10 +1,13 @@
 #lang racket
 
-;; Microcode construction functions
+;;; Microcode construction functions
 
+;; Store micro-word addresses
 (define control-pla (make-vector #o1777 null))
+;; Stores micro-word names, so that it's easier to visualize
 (define control-pla-alias (make-vector #o1777 null))
 
+;; Determines the next free micro-address
 (define (get-next-address)
   (define (get-addr s)
     (if (null? (vector-ref control-pla s))
@@ -13,40 +16,38 @@
   (get-addr 1))
 
 (define (deftype micro-address micro-word)
+  (let ((t (internal-deftype micro-address micro-word)))
+    (printf "Defining user-facing type ~o as ~a.\n" micro-address (vector-ref control-pla-alias micro-address))))
+
+;; Puts the micro-word into the pla-vector at a given address
+(define (internal-deftype micro-address micro-word)
   (vector-set! control-pla micro-address micro-word)
-  
   micro-address)
 
-(define-syntax-rule (defntype micro-alias micro-word)
-  (define micro-alias (deftype (get-next-address) micro-word)))
-
+;; We will define the micro-words for these user-facing types later
 (define-syntax-rule (defchip micro-alias micro-address)
   (begin (vector-set! control-pla-alias micro-address (quote micro-alias))
-         (define micro-alias (deftype micro-address #o000))))
+         (define micro-alias (internal-deftype micro-address #o000))))
+
+;; These all do the same thing, though they are defined slightly
+;; differently in the original spec.  All put a micro-word into the
+;; pla-vector at an address determined with get-next-address
+(define-syntax-rule (defntype micro-alias micro-word)
+  (begin (vector-set! control-pla-alias (get-next-address) (quote micro-alias))
+         (define micro-alias (internal-deftype (get-next-address) micro-word))))
 
 (define-syntax-rule (defreturn micro-alias micro-word)
   (begin (vector-set! control-pla-alias (get-next-address) (quote micro-alias))
-         (define micro-alias (deftype (get-next-address) micro-word))))
+         (define micro-alias (internal-deftype (get-next-address) micro-word))))
 
 (define-syntax-rule (defpc micro-alias micro-word)
   (begin (vector-set! control-pla-alias (get-next-address) (quote micro-alias))
-         (define micro-alias (deftype (get-next-address) micro-word))))
+         (define micro-alias (internal-deftype (get-next-address) micro-word))))
 
-(define (type-shift x) (arithmetic-shift x 24))
-(define (type-unshift x) (arithmetic-shift (use-unset x) -24))
-(define type-clear #o20077777777)
-(define (type-equal? x t) (= (type x) t))
-
-(define (datum x) (bitwise-and x #o00077777777))
-(define (datum-set x y) (bitwise-ior (type+use x) (datum y))) ;; return x with y's datum
-
-(define (displacement x) (arithmetic-shift (datum x) 11))
-(define (frame x) (bitwise-and x #o3777))
-
-(define (type x) (bitwise-and x #o17700000000))
-(define (p-type x) (= (bitwise-and x #o10000000000) #o10000000000))
-
-(define (type+use x) (bitwise-and x #o37700000000))
+;;; Bit manipulation methods.  None of these actually set!, just
+;;; produce new numbers--don't be confused by the set and unset.
+;;; [31 use |30 type 24|23 datum 0]
+;;; Racket doesn't have logical shifts, of course, so these are all arithmetic
 
 (define (use? x) (= (bitwise-and x #o20000000000) #o20000000000))
 (define (use-set x) (bitwise-ior x #o20000000000))
@@ -55,8 +56,177 @@
 (define (trace? x) (= (bitwise-and x #o20000000000) #o20000000000))
 (define (trace-set x) (bitwise-ior x #o20000000000))
 (define (trace-unset x) (bitwise-and x #o17777777777))
-;; Types (op-codes)
 
+(define (type-set x type) (bitwise-ior (type-shift type) (bitwise-and x #o20077777777)))
+(define (type-shift x) (arithmetic-shift x 24))
+(define (type-unshift x) (arithmetic-shift (use-unset x) -24))
+(define (type x) (bitwise-and x #o17700000000))
+(define (p-type? x) (= (bitwise-and x #o10000000000) #o10000000000))
+(define (type-equal? x t) (= (type x) t))
+
+(define (type+use x) (bitwise-and x #o37700000000))
+
+(define (datum x) (bitwise-and x #o00077777777))
+(define (datum-set x y) (bitwise-ior (type+use x) (datum y)))
+
+;; For use in constructing environment frames with the exp register.
+(define (displacement x) (arithmetic-shift (datum x) 11))
+(define (set-displacement x d)
+  (bitwise-ior
+   (type+use x)
+   (arithmetic-shift d 11)
+   (frame x)))
+(define (frame x) (bitwise-and x #o3777))
+(define (set-frame x f)
+  (bitwise-ior
+   (type+use x)
+   (arithmetic-shift (displacement x) 11)
+   f))
+
+;;; Chip feature definitions.
+
+;; stores state of FSM--currently executing type
+(define state #o0)
+
+;; Pads
+(define address/data #o0)
+(define gc-needed #o0)
+(define interrupt-request #o0)
+
+;;; Memory
+
+;; Make our memory.  Our memory is controlled off chip, of course, but
+;; it makes sense for the emulator for our physical address space to
+;; just be the maximum virtual address space of the chip--2^24 cells.
+(define mem (make-vector #o100000000 (cons #o0 #o0)))
+
+;; In essence, our memory controller.  This gets kind of mixed into
+;; our hardware definitions--in reality, this would be more
+;; complicated, with interrupts and the memory controller having to
+;; read from the virtual address register.  This is a pain, however,
+;; and pointless for emulation.
+(define (mem-set! addr acar acdr) (vector-set! mem addr (cons acar acdr)))
+(define (mem-car addr) (car (vector-ref mem addr)))
+(define (mem-cdr addr) (cdr (vector-ref mem addr)))
+(define (mem-set-car! addr acar)
+  (vector-set! mem addr (cons acar (cdr (vector-ref mem addr)))))
+(define (mem-set-cdr! addr acdr)
+  (vector-set! mem addr (cons (car (vector-ref mem addr)) acdr)))
+
+;;; Microcode helper functions, that would be implemented in hardware
+;;; differently then normal hardware operations on the chip
+
+(define-syntax-rule (assign reg source) (set! reg source))
+(define (fetch reg) reg)
+
+(define (go-to s) (set! state s))
+
+(define (micro-call maddr1 maddr2)
+  ;; This is storing the micro-return address maddr1 in type field of *retpc-count-mark*
+  (&set-type *retpc-count-mark* maddr2)
+  (go-to maddr1))
+
+(define (micro-return)
+  ;; This returns to the micro-return address maddr1 in type field of *retpc-count-mark*
+  (go-to (type-unshift (fetch *retpc-count-mark*))))
+
+(define (save quantity)
+  (assign *stack* (&cons quantity (fetch *stack*))))
+
+(define-syntax-rule (restore register)
+  (begin (assign register (&car (fetch *stack*)))
+         (assign *stack* (&cdr (fetch *stack*)))))
+
+(define (dispatch reg)
+  (go-to (type-unshift (fetch reg))))
+
+(define (dispatch-on-exp-allowing-interrupts)
+  (dispatch *exp*))
+
+(define (dispatch-on-stack)
+  (dispatch *stack*))
+
+(define (eval-exp-popj-to type)
+  (&set-type *stack* type)
+  (save *stack*)
+  (dispatch-on-exp-allowing-interrupts))
+
+;;; Hardware operations
+
+;; Pure register operations
+(define (&=type? reg type) (type-equal? reg (type-shift type)))
+(define-syntax-rule (&set-type reg type)
+  (set! reg (type-set reg type)))
+
+(define (&pointer? addr1) (p-type? addr1))
+(define (&get-interrupt-routine-pointer)
+  (when (= interrupt-request #o1) (datum address/data)))
+
+(define (&eq-val reg) (= *val* reg))
+(define (&val=0?) (= (datum *val*) 0))
+
+;; Memory operations
+(define (&cons reg1 reg2)
+  (cond ((= *newcell* *memtop*)
+         (display "Sorry, garbage collection isn't implemented yet.\n")
+         (go-to done))
+        (true
+         (&rplaca *newcell* reg1)
+         (&rplacd *newcell* reg2)
+         (set! *newcell* (add1 *newcell*))
+         (type-set (sub1 *newcell*) (type-unshift (type *stack*))))))
+
+(define (&car reg) (fetch (mem-car (datum reg))))
+(define (&cdr reg) (fetch (mem-cdr (datum reg))))
+(define &global-value &car)
+
+(define (&rplaca reg1 reg2) (mem-set-car! (datum reg1) reg2))
+(define (&rplacd reg1 reg2) (mem-set-cdr! (datum reg1) reg2))
+(define &set-global-value &rplaca)
+
+;; Used with frames and basic arithmetic
+(define (&frame=0?) (= (frame *exp*) #o0))
+(define (&decrement-frame) (set! *exp* (- *exp* #o1)))
+
+(define (&displacement=0?) (= (displacement *exp*) #o0))
+(define (&decrement-displacement)
+  (set! *exp* (set-displacement *exp* (sub1 (displacement *exp*)))))
+
+(define (&decrement-scan-down-to-val) (set! *val* (sub1 *scan-down*)))
+(define (&increment-scan-up-to-val) (set! *val* (add1 *scan-up*)))
+(define (&val-displacement-to-exp-displacement)
+  (set! *exp* (set-displacement *exp* (displacement *val*))))
+(define (&val-frame-to-exp-frame)
+  (set! *exp* (set-frame *exp* (frame *val*))))
+
+;; Used by garbage collector -- these are untested, as I haven't
+;; implemented garbage collector yet.  Regardless, they need some
+;; work, we shouldn't be using any bit ops directly in our hardware
+;; operations.
+
+(define (&rplaca-and-mark! addr1 addr2) (&rplaca addr1 addr2) (&mark-in-use! addr1))
+
+(define (&in-use? reg) (use? reg))
+(define (&mark-in-use! addr1) (vector-set! mem addr1 (cons (use-set (mem-car addr1)) (mem-cdr addr1))))
+(define (&unmark! addr1) (vector-set! mem addr1 (cons (use-unset (mem-car addr1)) (mem-cdr addr1))))
+
+(define (&car-being-traced? addr1) (trace? (mem-cdr addr1)))
+(define (&mark-car-being-traced! addr1) (vector-set! mem addr1 (cons (mem-car addr1) (trace-set (mem-cdr addr1)))))
+(define (&mark-car-trace-over! addr1) (vector-set! mem addr1 (cons (mem-car addr1) (trace-unset (mem-cdr addr1)))))
+
+(define (&clear-gc-needed) (set! gc-needed #o0))
+
+(define (&scan-down=0?) (= *scan-down* #o0))
+
+(define-syntax-rule (&increment-scan-up) (set! *scan-up* (add1 *scan-up*)))
+(define-syntax-rule (&decrement-scan-down) (set! *scan-down* (sub1 *scan-down*)))
+(define (&scan-up=scan-down?) (= *scan-up* *scan-down*))
+
+;;; Microcode definition!  This is for the most part identical to the
+;;; paper's, with the exception of the macros used to define things,
+;;; and a couple tiny changes.
+
+;; User-facing types.
 (defchip symbol #o001)
 (defchip global #o002)
 (defchip set-global #o003)
@@ -109,8 +279,6 @@
 (defchip boot-load #o776)
 (defchip process-interrupt #o777)
 
-;; Hardware definitions
-
 ;; Registers, on chip
 (define *nil* #o0)
 (define *memtop* #o0)
@@ -130,138 +298,9 @@
 (define *retpc-count-mark* #o0)
 (define *intermediate-argument* #o0)
 
-;; stores state of FSM
-(define state #o0)
-
-(define-syntax-rule (go-to s) (set! state s))
-
-;; Pads
-(define address/data #o0)
-(define gc-needed #o0)
-(define interrupt-request #o0)
-
-(define-syntax-rule (assign reg source) (set! reg source))
-(define (fetch reg) reg)
-
-;;; Memory
-
-(define mem (make-vector #o100000000 (cons #o0 #o0))) ;; 2^24
-(define (mem-set! addr acar acdr) (vector-set! mem addr (cons acar acdr)))
-(define (mem-car addr) (car (vector-ref mem addr)))
-(define (mem-cdr addr) (cdr (vector-ref mem addr)))
-(define (mem-set-car! addr acar)
-  (vector-set! mem addr (cons acar (cdr (vector-ref mem addr)))))
-(define (mem-set-cdr! addr acdr)
-  (vector-set! mem addr (cons (car (vector-ref mem addr)) acdr)))
-
-;;; Hardware ops
-
-(define (&=type? reg type) (type-equal? reg (type-shift type)))
-
-
-(define (&cons reg1 reg2)
-  (cond ((= *newcell* *memtop*)
-         (display "Sorry, garbage collection isn't implemented yet.\n")
-         (go-to done))
-        (true
-         (&rplaca *newcell* reg1)
-         (&rplacd *newcell* reg2)
-         (set! *newcell* (+ *newcell* 1))
-         (- *newcell* 1))))
-
-(define (&car reg) (fetch (mem-car (datum reg))))
-(define (&cdr reg) (fetch (mem-cdr (datum reg))))
-(define &global-value &car)
-
-(define (&rplaca reg1 reg2) (mem-set-car! (datum reg1) reg2))
-(define (&rplacd reg1 reg2) (mem-set-cdr! (datum reg1) reg2))
-(define &set-global-value &rplaca)
-
-(define (&pointer? addr1) (p-type addr1))
-
-(define (&get-interrupt-routine-pointer)
-  (when (= interrupt-request #o1) (datum address/data)))
-(define-syntax-rule (&set-type reg type)
-  (set! reg (bitwise-ior (type-shift type) reg)))
-
-(define (&frame=0?) (= (frame *exp*) #o0))
-(define (&decrement-frame) (set! *exp* (- *exp* #o1)))
-
-(define (&displacement=0?) (= (displacement *exp*) #o0))
-(define (&decrement-displacement)
-  (set! *exp* (bitwise-ior
-               (type+use *exp*)
-               (arithmetic-shift (- (displacement *exp*) #o1) 11)
-               (frame *exp*))))
-
-(define (&eq-val reg) (= *val* reg))
-(define (&val=0?) (= (datum *val*) 0))
-
-(define (&decrement-scan-down-to-val) (set! *val* (sub1 *scan-down*)))
-(define (&increment-scan-up-to-val) (set! *val* (add1 *scan-up*)))
-(define (&val-displacement-to-exp-displacement)
-  (set! *exp* (bitwise-ior
-               (type+use *exp*)
-               (arithmetic-shift (displacement *val*) 11)
-               (frame *exp*))))
-(define (&val-frame-to-exp-frame)
-  (set! *exp* (bitwise-ior
-               (type+use *exp*)
-               (arithmetic-shift (displacement *exp*) 11)
-               (frame *val*))))
-
-;; Used by garbage collector
-
-(define (&rplaca-and-mark! addr1 addr2) (&rplaca addr1 addr2) (&mark-in-use! addr1))
-
-(define (&in-use? reg) (use? reg))
-(define (&mark-in-use! addr1) (vector-set! mem addr1 (cons (use-set (mem-car addr1)) (mem-cdr addr1))))
-(define (&unmark! addr1) (vector-set! mem addr1 (cons (use-unset (mem-car addr1)) (mem-cdr addr1))))
-
-(define (&car-being-traced? addr1) (trace? (mem-cdr addr1)))
-(define (&mark-car-being-traced! addr1) (vector-set! mem addr1 (cons (mem-car addr1) (trace-set (mem-cdr addr1)))))
-(define (&mark-car-trace-over! addr1) (vector-set! mem addr1 (cons (mem-car addr1) (trace-unset (mem-cdr addr1)))))
-
-(define (&clear-gc-needed) (set! gc-needed #o0))
-
-(define (&scan-down=0?) (= *scan-down* #o0))
-
-(define-syntax-rule (&increment-scan-up) (set! *scan-up* (add1 *scan-up*)))
-(define-syntax-rule (&decrement-scan-down) (set! *scan-down* (sub1 *scan-down*)))
-(define (&scan-up=scan-down?) (= *scan-up* *scan-down*))
-
-(define (micro-call maddr1 maddr2)
-  ;; This is storing the micro-return address maddr1 in type field of *retpc-count-mark*
-  (&set-type *retpc-count-mark* maddr2)
-  (go-to maddr1))
-
-(define (micro-return)
-  ;; This returns to the micro-return address maddr1 in type field of *retpc-count-mark*
-  (go-to (type-unshift (fetch *retpc-count-mark*))))
-
-(define (save quantity)
-  (assign *stack* (&cons quantity (fetch *stack*))))
-
-(define (restore register)
-  (begin (assign register (&car (fetch *stack*)))
-         (assign *stack* (&cdr (fetch *stack*)))))
-
-(define (dispatch reg)
-  (go-to (type-unshift (fetch reg))))
-
-(define (dispatch-on-stack)
-  (dispatch *stack*))
-
-(define (dispatch-on-exp-allowing-interrupts)
-  (dispatch *exp*))
-
-(define (eval-exp-popj-to type)
-  (go-to type)) ;; fucking "Amazing! where did retpc go" IS NOT DOCUMENTATION!!!!!
-
-;;; Micro-word simulation definitions
+;; Micro-word simulation definitions
 
 ;; Boot load sequence
-
 (deftype boot-load
   (lambda () 
     (assign *scan-up* (fetch *nil*))
@@ -284,7 +323,6 @@
     (go-to done)))
 
 ;; Garbage collection words
-
 (deftype mark
   (lambda () 
     (&rplaca (fetch *nil*) (fetch *stack*))
@@ -394,6 +432,7 @@
           (true (&decrement-scan-down)
                 (go-to relocate-pointers)))))
 
+;; Variable management
 (deftype local
   (lambda ()
     (micro-call lookup-exp local-return)))
@@ -467,6 +506,8 @@
                (assign *display* (&cdr (fetch *display*)))
                (go-to count-displacement)))))
 
+;; The user can choose for these to be different things, like ints,
+;; floats, etc.
 (deftype self-evaluating-immediate
   (lambda ()
     (assign *val* (fetch *exp*))
@@ -522,12 +563,14 @@
     (assign *val* (fetch *exp*))
     (dispatch-on-stack)))
 
+;; Basic procedure definition
 (deftype procedure
   (lambda ()
     (assign *val* (&cons (fetch *exp*) (fetch *display*)))
     (&set-type *val* closure)
     (dispatch-on-stack)))
 
+;; Conditional, handels non substition evaluation (special forms)
 (deftype conditional
   (lambda ()
     (if (&eq-val (fetch *nil*))
@@ -535,11 +578,15 @@
         (assign *exp* (&car (fetch *exp*))))
     (dispatch-on-exp-allowing-interrupts)))
 
-;; Micro return address stored in *retpc-count-mark*, which will be stuck on the stack.
-;; Then we evaluate the car.
+;; Micro return address stored in *retpc-count-mark*, which will be
+;; stuck on the stack. Then we evaluate the car.  This is not
+;; microcode, its a helper function.  This gets used extensively by
+;; eval and apply
 (define (save-cdr-and-eval-car return-tag)
   (begin (&set-type *retpc-count-mark* return-tag)
          (go-to standard-eval)))
+
+;; Function evaluation
 
 (defpc standard-eval
   (lambda ()
@@ -557,6 +604,7 @@
     (restore *display*)
     (dispatch (fetch *retpc-count-mark*))))
 
+;; Function with multiple arguments packages them in a sequence
 (deftype sequence
   (lambda ()
     (assign *val* (fetch *nil*))
@@ -628,6 +676,7 @@
     (save (fetch *nil*))
     (eval-exp-popj-to internal-apply)))
 
+;; This is normal apply--for any number of arguments.
 (deftype spread-argument
   (lambda ()
     (save-cdr-and-eval-car spread-argument-return)))
@@ -643,12 +692,15 @@
     (assign *exp* (fetch *val*))
     (dispatch-on-exp-allowing-interrupts)))
 
+;; Procedures get turned into closures in their environment.
 (deftype closure
   (lambda ()
     (assign *display*
             (&cons (fetch *args*) (&cdr (fetch *exp*))))
     (assign *exp* (&car (&car (fetch *exp*)))) ;; 2 cars because documentation is in first
     (dispatch-on-exp-allowing-interrupts)))
+
+;; Used for special forms
 
 (deftype control-point
   (lambda ()
@@ -662,6 +714,8 @@
     (restore *val*)
     (restore *display*)
     (go-to restore-exp-args-dispatch)))
+
+;; Primitive functions
 
 (deftype primitive-apply-1
   (lambda ()
@@ -699,6 +753,10 @@
         (assign *val* (fetch *nil*)))
     (dispatch-on-stack)))
 
+;; Functions used with peano arithmetic, ideally the user would have a
+;; seperate coprocessor to do math (think Intel 8087), and interface
+;; with it using interrupts.
+
 (deftype primitive-zerop
   (lambda ()
     (if (&val=0?)
@@ -733,6 +791,8 @@
     (&val-frame-to-exp-frame)
     (assign *val* (fetch *exp*))
     (dispatch-on-stack)))
+
+;; Back to normal primitve functions.
 
 (deftype primitive-apply-2
   (lambda ()
@@ -783,6 +843,8 @@
     (&set-type *val* (fetch *exp*))
     (dispatch-on-stack)))
 
+;; Finally, our interrupt handler!
+
 (deftype process-interrupt
   (lambda ()
     (save (fetch *args*))
@@ -794,27 +856,15 @@
     (assign *exp* (&car (&get-interrupt-routine-pointer)))
     (dispatch-on-exp-allowing-interrupts)))
 
-;; Mem-init
-(mem-set! #o0 #o0 #o0)       ;; NIL
-(mem-set! #o1 #o1000 #o0)    ;; initial *MEMTOP*
-(set! address/data #o1001)     ;; interrrupt vector, has location of proc to exec
-(set! interrupt-request #o1) ;; we will read an interrupt
-
 (define (make-car t d)
   (bitwise-ior (type-shift t) d))
 
 (define make-cdr make-car)
 
-;; (mem-set! #o1001 (make-car self-evaluating-immediate-1 #o11) #o0)
-
-(mem-set! #o1001 (make-car spread-argument #o1002) #o1100)
-(mem-set! #o1002 (make-car first-argument #o1003) #o1004)
-(mem-set! #o1003 (make-car self-evaluating-immediate-1 #o11) #o0)
-(mem-set! #o1004 (make-car last-argument #o1005) #o1100)
-(mem-set! #o1004 (make-car self-evaluating-immediate-1 #o12) #o0)
-
 (define (cycle state)
   ((vector-ref control-pla state)))
+
+;;; Functions used with CLI
 
 ;; Debug functions
 (define (print-mem-addr addr)
@@ -880,11 +930,42 @@
          (print-registers)
          (print-mem (+ *newcell* #o2))
          (cycle state)
-         (display "continue ")
+         (display "Type s to step: ")
          (read)
          (step))))
 
-;;(display control-pla-alias)
+(define (initialize-scheme-79)
+  (display "\nInitializing scheme-79 with values:\n")
+  (printf "Memtop: ~o\n" (mem-car #o1))
+  (printf "Initial procedure is at memory location: ~o\n" address/data)
+  (go-to boot-load)
+  (printf "\nStarting boot load sequence...\n\n"))
 
-(go-to boot-load)
+;;; Memory initialization.  This is all standard.
+(mem-set! #o0 #o0 #o0)       ;; NIL
+(mem-set! #o1 #o1000 #o0)    ;; initial *MEMTOP*
+(set! address/data #o1001)   ;; interrrupt vector, has location of proc to exec
+(set! interrupt-request #o1) ;; we will read an interrupt
+
+;;; Test programs.  TODO: interface to read and write programs more easily.
+
+;; (mem-set! #o1001 (make-car self-evaluating-immediate-1 #o11) #o0)
+
+;; Take car of #o2000
+;; (mem-set! #o1001 (make-car primitive-apply-1 #o1002) #o0)
+;; (mem-set! #o1002 (make-car self-evaluating-pointer-1 #o2000) (make-cdr primitive-car #o0))
+;; (mem-set! #o2000 (make-car self-evaluating-immediate-1 #o11) (make-cdr self-evaluating-immediate-1 #o12))
+
+;; Take cdr of #o2000
+;; (mem-set! #o1001 (make-car primitive-apply-1 #o1002) #o0)
+;; (mem-set! #o1002 (make-car self-evaluating-pointer-1 #o2000) (make-cdr primitive-cdr #o0))
+;; (mem-set! #o2000 (make-car self-evaluating-immediate-1 #o11) (make-cdr self-evaluating-immediate-1 #o12))
+
+((lambda () 3))
+(mem-set! #o1001 (make-car apply-no-args #o1002) #o0)
+(mem-set! #o1002 (make-car procedure #o2000) #o0)
+(mem-set! #o2000 (make-car self-evaluating-immediate #o3) #o0)
+
+;; Start running our program!
+(initialize-scheme-79)
 (step)
